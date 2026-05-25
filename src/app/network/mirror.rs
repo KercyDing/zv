@@ -44,8 +44,11 @@
 //! ```
 
 use std::{
+    cmp::Ordering,
+    collections::HashMap,
     convert::TryFrom,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use super::download::download_file;
@@ -60,7 +63,8 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use color_eyre::eyre::Result;
-use reqwest::Client;
+use futures::{StreamExt, stream};
+use reqwest::{Client, StatusCode};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -484,6 +488,57 @@ pub struct MirrorsIndex {
     pub last_synced: DateTime<Utc>,
 }
 
+// ============================================================================
+// MIRROR BENCHMARKING
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankApplyPolicy {
+    Overwrite,
+    Blend,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MirrorBenchmarkResult {
+    pub base_url: Url,
+    pub old_rank: u8,
+    pub old_layout: Layout,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_layout: Option<Layout>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_read: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_per_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl MirrorBenchmarkResult {
+    pub fn is_success(&self) -> bool {
+        self.bytes_per_second.is_some()
+    }
+}
+
+#[derive(Debug)]
+enum BenchmarkProbeError {
+    Http(StatusCode),
+    Network(reqwest::Error),
+    EmptyBody,
+}
+
+impl std::fmt::Display for BenchmarkProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(status) => write!(f, "HTTP {}", status),
+            Self::Network(err) if err.is_timeout() => write!(f, "request timed out"),
+            Self::Network(err) => write!(f, "{err}"),
+            Self::EmptyBody => write!(f, "response body was empty"),
+        }
+    }
+}
+
 impl MirrorsIndex {
     /// Create a new index with current timestamp
     pub fn new(mirrors: Vec<Mirror>) -> Self {
@@ -819,5 +874,452 @@ impl MirrorManager {
 
         tracing::debug!(target: TARGET, "Successfully saved mirrors index to {}", self.cache_path.display());
         Ok(())
+    }
+
+    /// Benchmark all loaded mirrors using bounded partial downloads.
+    pub async fn benchmark_mirrors(
+        &mut self,
+        semver_version: &Version,
+        zig_tarball: &str,
+        sample_size: u64,
+        concurrency: usize,
+    ) -> Result<Vec<MirrorBenchmarkResult>, NetErr> {
+        let mirrors = self.all_mirrors_mut().await?.to_vec();
+        if mirrors.is_empty() {
+            return Err(NetErr::EmptyMirrors);
+        }
+
+        let sample_size = sample_size.max(1);
+        let concurrency = concurrency.max(1);
+        let client = self.client.clone();
+        let semver_version = semver_version.clone();
+        let zig_tarball = zig_tarball.to_string();
+
+        let mut results = stream::iter(mirrors.into_iter().map(|mirror| {
+            let client = client.clone();
+            let semver_version = semver_version.clone();
+            let zig_tarball = zig_tarball.clone();
+            async move {
+                benchmark_single_mirror(client, mirror, semver_version, zig_tarball, sample_size)
+                    .await
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+        results.sort_by(|a, b| {
+            benchmark_result_sort_key(a, b)
+                .then_with(|| a.base_url.as_str().cmp(b.base_url.as_str()))
+        });
+
+        Ok(results)
+    }
+
+    /// Apply benchmark results to in-memory mirrors and persist the updated mirror cache.
+    pub async fn apply_benchmark_results(
+        &mut self,
+        results: &[MirrorBenchmarkResult],
+        policy: RankApplyPolicy,
+    ) -> Result<(), NetErr> {
+        self.all_mirrors_mut().await?;
+
+        let ordered = ordered_benchmark_results(results, policy);
+        let rank_by_url: HashMap<String, u8> = ordered
+            .iter()
+            .enumerate()
+            .map(|(idx, result)| (result.base_url.to_string(), rank_for_index(idx)))
+            .collect();
+        let layout_by_url: HashMap<String, Layout> = results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .measured_layout
+                    .map(|layout| (result.base_url.to_string(), layout))
+            })
+            .collect();
+
+        for mirror in &mut self.mirrors {
+            if let Some(rank) = rank_by_url.get(mirror.base_url.as_str()) {
+                mirror.rank = *rank;
+            }
+            if let Some(layout) = layout_by_url.get(mirror.base_url.as_str()) {
+                mirror.layout = *layout;
+            }
+        }
+
+        self.mirrors.sort_by(|a, b| {
+            a.rank
+                .cmp(&b.rank)
+                .then_with(|| a.base_url.cmp(&b.base_url))
+        });
+        self.save_index_to_disk().await
+    }
+}
+
+async fn benchmark_single_mirror(
+    client: Client,
+    mirror: Mirror,
+    semver_version: Version,
+    zig_tarball: String,
+    sample_size: u64,
+) -> MirrorBenchmarkResult {
+    let old_rank = mirror.rank;
+    let old_layout = mirror.layout;
+
+    match probe_mirror_layout(&client, &mirror, &semver_version, &zig_tarball, sample_size).await {
+        Ok(measurement) => benchmark_success(mirror.base_url, old_rank, old_layout, measurement),
+        Err(BenchmarkProbeError::Http(status)) if status.as_u16() == 404 => {
+            let mut alternate = mirror.clone();
+            alternate.layout = !alternate.layout;
+            match probe_mirror_layout(
+                &client,
+                &alternate,
+                &semver_version,
+                &zig_tarball,
+                sample_size,
+            )
+            .await
+            {
+                Ok(measurement) => {
+                    benchmark_success(mirror.base_url, old_rank, old_layout, measurement)
+                }
+                Err(err) => benchmark_failure(mirror.base_url, old_rank, old_layout, err),
+            }
+        }
+        Err(err) => benchmark_failure(mirror.base_url, old_rank, old_layout, err),
+    }
+}
+
+struct BenchmarkMeasurement {
+    layout: Layout,
+    bytes_read: u64,
+    elapsed: Duration,
+}
+
+async fn probe_mirror_layout(
+    client: &Client,
+    mirror: &Mirror,
+    semver_version: &Version,
+    zig_tarball: &str,
+    sample_size: u64,
+) -> Result<BenchmarkMeasurement, BenchmarkProbeError> {
+    let url = mirror.get_download_url(semver_version, zig_tarball);
+    let range_end = sample_size.saturating_sub(1);
+    let start = Instant::now();
+    let response = client
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{range_end}"))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(BenchmarkProbeError::Network)?;
+
+    match response.status() {
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT => {}
+        status => return Err(BenchmarkProbeError::Http(status)),
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut bytes_read = 0u64;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(BenchmarkProbeError::Network)?;
+        let remaining = sample_size.saturating_sub(bytes_read);
+        if remaining == 0 {
+            break;
+        }
+        bytes_read += (chunk.len() as u64).min(remaining);
+        if bytes_read >= sample_size {
+            break;
+        }
+    }
+
+    if bytes_read == 0 {
+        return Err(BenchmarkProbeError::EmptyBody);
+    }
+
+    Ok(BenchmarkMeasurement {
+        layout: mirror.layout,
+        bytes_read,
+        elapsed: start.elapsed(),
+    })
+}
+
+fn benchmark_success(
+    base_url: Url,
+    old_rank: u8,
+    old_layout: Layout,
+    measurement: BenchmarkMeasurement,
+) -> MirrorBenchmarkResult {
+    let elapsed_secs = measurement.elapsed.as_secs_f64().max(0.001);
+    MirrorBenchmarkResult {
+        base_url,
+        old_rank,
+        old_layout,
+        measured_layout: Some(measurement.layout),
+        bytes_read: Some(measurement.bytes_read),
+        elapsed_ms: Some(measurement.elapsed.as_millis()),
+        bytes_per_second: Some(measurement.bytes_read as f64 / elapsed_secs),
+        error: None,
+    }
+}
+
+fn benchmark_failure(
+    base_url: Url,
+    old_rank: u8,
+    old_layout: Layout,
+    err: BenchmarkProbeError,
+) -> MirrorBenchmarkResult {
+    MirrorBenchmarkResult {
+        base_url,
+        old_rank,
+        old_layout,
+        measured_layout: None,
+        bytes_read: None,
+        elapsed_ms: None,
+        bytes_per_second: None,
+        error: Some(err.to_string()),
+    }
+}
+
+fn benchmark_result_sort_key(a: &MirrorBenchmarkResult, b: &MirrorBenchmarkResult) -> Ordering {
+    match (a.bytes_per_second, b.bytes_per_second) {
+        (Some(a_bps), Some(b_bps)) => b_bps.partial_cmp(&a_bps).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.old_rank.cmp(&b.old_rank),
+    }
+}
+
+fn ordered_benchmark_results(
+    results: &[MirrorBenchmarkResult],
+    policy: RankApplyPolicy,
+) -> Vec<&MirrorBenchmarkResult> {
+    match policy {
+        RankApplyPolicy::Overwrite => {
+            let mut ordered = results.iter().collect::<Vec<_>>();
+            ordered.sort_by(|a, b| {
+                benchmark_result_sort_key(a, b)
+                    .then_with(|| a.base_url.as_str().cmp(b.base_url.as_str()))
+            });
+            ordered
+        }
+        RankApplyPolicy::Blend => {
+            let mut successes = results
+                .iter()
+                .filter(|result| result.is_success())
+                .collect::<Vec<_>>();
+            successes.sort_by(|a, b| {
+                benchmark_result_sort_key(a, b)
+                    .then_with(|| a.base_url.as_str().cmp(b.base_url.as_str()))
+            });
+
+            let speed_rank_by_url: HashMap<String, usize> = successes
+                .iter()
+                .enumerate()
+                .map(|(idx, result)| (result.base_url.to_string(), idx + 1))
+                .collect();
+
+            let mut failures = results
+                .iter()
+                .filter(|result| !result.is_success())
+                .collect::<Vec<_>>();
+            failures.sort_by(|a, b| {
+                a.old_rank
+                    .cmp(&b.old_rank)
+                    .then_with(|| a.base_url.as_str().cmp(b.base_url.as_str()))
+            });
+
+            successes.sort_by(|a, b| {
+                let a_speed_rank = speed_rank_by_url
+                    .get(a.base_url.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                let b_speed_rank = speed_rank_by_url
+                    .get(b.base_url.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                let a_score = a.old_rank as f64 + a_speed_rank as f64;
+                let b_score = b.old_rank as f64 + b_speed_rank as f64;
+                a_score
+                    .partial_cmp(&b_score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.base_url.as_str().cmp(b.base_url.as_str()))
+            });
+
+            successes.extend(failures);
+            successes
+        }
+    }
+}
+
+fn rank_for_index(idx: usize) -> u8 {
+    u8::try_from(idx + 1).unwrap_or(u8::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tempfile::tempdir;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path},
+    };
+
+    fn test_mirror(url: &str, rank: u8) -> Mirror {
+        Mirror {
+            base_url: Url::parse(url).unwrap(),
+            layout: Layout::Flat,
+            rank,
+        }
+    }
+
+    fn benchmark_result(
+        url: &str,
+        old_rank: u8,
+        bytes_per_second: Option<f64>,
+    ) -> MirrorBenchmarkResult {
+        MirrorBenchmarkResult {
+            base_url: Url::parse(url).unwrap(),
+            old_rank,
+            old_layout: Layout::Flat,
+            measured_layout: bytes_per_second.map(|_| Layout::Flat),
+            bytes_read: bytes_per_second.map(|_| 1024),
+            elapsed_ms: bytes_per_second.map(|_| 10),
+            bytes_per_second,
+            error: if bytes_per_second.is_some() {
+                None
+            } else {
+                Some("failed".to_string())
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn overwrite_policy_sets_speed_order_and_places_failures_last() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("mirrors.toml");
+        let mut manager = MirrorManager::new(&cache_path).unwrap();
+        manager.mirrors = vec![
+            test_mirror("https://slow.example", 1),
+            test_mirror("https://fast.example", 5),
+            test_mirror("https://failed.example", 2),
+        ];
+        manager.mirrors_index = Some(MirrorsIndex {
+            mirrors: manager.mirrors.clone(),
+            last_synced: Utc::now(),
+        });
+
+        let results = vec![
+            benchmark_result("https://slow.example/", 1, Some(10.0)),
+            benchmark_result("https://fast.example/", 5, Some(100.0)),
+            benchmark_result("https://failed.example/", 2, None),
+        ];
+
+        manager
+            .apply_benchmark_results(&results, RankApplyPolicy::Overwrite)
+            .await
+            .unwrap();
+
+        let ranks = manager
+            .mirrors
+            .iter()
+            .map(|m| (m.base_url.as_str().to_string(), m.rank))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(ranks["https://fast.example/"], 1);
+        assert_eq!(ranks["https://slow.example/"], 2);
+        assert_eq!(ranks["https://failed.example/"], 3);
+        assert!(cache_path.is_file());
+    }
+
+    #[test]
+    fn blend_policy_keeps_existing_rank_signal() {
+        let results = vec![
+            benchmark_result("https://current-best.example/", 1, Some(50.0)),
+            benchmark_result("https://fast-but-low-priority.example/", 10, Some(100.0)),
+            benchmark_result("https://middle.example/", 5, Some(75.0)),
+        ];
+
+        let ordered = ordered_benchmark_results(&results, RankApplyPolicy::Blend);
+        let urls = ordered
+            .iter()
+            .map(|result| result.base_url.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://current-best.example/",
+                "https://middle.example/",
+                "https://fast-but-low-priority.example/"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn benchmark_uses_range_requests_and_records_throughput() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/zig.tar.xz"))
+            .and(header("range", "bytes=0-9"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(vec![7; 10]))
+            .mount(&server)
+            .await;
+
+        let cache_path = tempdir().unwrap().path().join("mirrors.toml");
+        let mut manager = MirrorManager::new(cache_path).unwrap();
+        manager.mirrors = vec![test_mirror(&server.uri(), 1)];
+        manager.mirrors_index = Some(MirrorsIndex {
+            mirrors: manager.mirrors.clone(),
+            last_synced: Utc::now(),
+        });
+
+        let results = manager
+            .benchmark_mirrors(&Version::new(0, 15, 1), "zig.tar.xz", 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_success());
+        assert_eq!(results[0].bytes_read, Some(10));
+        assert_eq!(results[0].measured_layout, Some(Layout::Flat));
+    }
+
+    #[tokio::test]
+    async fn benchmark_tries_alternate_layout_after_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/0.15.1/zig.tar.xz"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/zig.tar.xz"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(vec![7; 10]))
+            .mount(&server)
+            .await;
+
+        let cache_path = tempdir().unwrap().path().join("mirrors.toml");
+        let mut manager = MirrorManager::new(cache_path).unwrap();
+        let mut mirror = test_mirror(&server.uri(), 1);
+        mirror.layout = Layout::Versioned;
+        manager.mirrors = vec![mirror];
+        manager.mirrors_index = Some(MirrorsIndex {
+            mirrors: manager.mirrors.clone(),
+            last_synced: Utc::now(),
+        });
+
+        let results = manager
+            .benchmark_mirrors(&Version::new(0, 15, 1), "zig.tar.xz", 10, 1)
+            .await
+            .unwrap();
+
+        assert!(results[0].is_success());
+        assert_eq!(results[0].old_layout, Layout::Versioned);
+        assert_eq!(results[0].measured_layout, Some(Layout::Flat));
+        assert_eq!(manager.mirrors[0].layout, Layout::Versioned);
     }
 }

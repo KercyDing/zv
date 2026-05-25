@@ -11,6 +11,7 @@ mod init;
 mod install;
 mod list;
 mod setup;
+mod speed;
 mod stats;
 pub mod sync; // Make sync public so other modules can use check_and_update_zv_binary
 mod uninstall;
@@ -286,6 +287,22 @@ pub enum Commands {
     /// Synchronize index, mirrors list and metadata for zv. Also replaces `ZV_DIR/bin/zv` if outdated against current invocation.
     Sync,
 
+    /// Benchmark community mirrors and optionally update mirror ranks
+    Speed {
+        /// Force mirrors/index network refresh before benchmarking.
+        #[arg(long, short = 'r')]
+        refresh: bool,
+        /// Number of mirrors to benchmark concurrently.
+        #[arg(long, short = 'j', default_value_t = speed::default_concurrency())]
+        concurrency: usize,
+        /// Number of MiB to sample from each mirror.
+        #[arg(long, short = 's', default_value_t = speed::default_sample_size())]
+        sample_size: u64,
+        /// Emit machine-readable JSON and do not prompt or save ranks.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show files, folders and disk usage managed by zv on this system
     Stats {
         /// Include file-level details under the downloads/ and zls-src/ caches
@@ -414,6 +431,12 @@ impl Commands {
                 no_color,
             } => stats::run(&app, verbose, json, no_color).await,
             Commands::Sync => sync::sync(&mut app).await,
+            Commands::Speed {
+                refresh,
+                concurrency,
+                sample_size,
+                json,
+            } => speed::speed(app, refresh, concurrency, sample_size, json).await,
             Commands::Uninstall => uninstall::uninstall(&mut app).await,
             Commands::Update { force, rc } => update::update_zv(&mut app, force, rc).await,
             Commands::Zls {

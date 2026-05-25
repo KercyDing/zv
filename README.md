@@ -24,7 +24,7 @@ which will always use version `0.16.0` when you run any `zig` command inside it.
 
 It also doubles as a project template starter, providing multiple variants of a Zig project, from a barebones template with a very trimmed-down `build.zig` and `main.zig` file, or the standard Zig project template. Find out more with `zv init --help`.
 
-`zv` uses randomized ranked community mirrors for downloads (can be overridden to use ziglang.org with -f), as that's the official recommendation, with `minisign` and `shasum` verification done before any toolchain is installed. Future versions should bring in an optimization to rank the mirrors based on speed so that faster mirrors are selected more often without user intervention.
+`zv` uses randomized ranked community mirrors for downloads (can be overridden to use ziglang.org with -f), as that's the official recommendation, with `minisign` and `shasum` verification done before any toolchain is installed. You can benchmark mirrors with `zv speed` and choose whether to apply the measured ranking.
 
 ## Usage
 
@@ -75,6 +75,11 @@ zv stats                               # Bird's-eye view of disk usage: data/con
 zv stats --verbose | -v                # Also list individual tarballs in downloads/
 zv stats --json                        # Machine-readable JSON
 zv stats --no-color                    # Disable ANSI colors (for piping)
+zv speed                               # Benchmark community mirrors, then choose whether to update mirror ranks
+zv speed --refresh | -r                # Refresh mirrors/index before benchmarking
+zv speed --sample-size <MiB> | -s <MiB> # Sample this many MiB per mirror (default: 4)
+zv speed --concurrency <N> | -j <N>    # Benchmark this many mirrors in parallel (default: 4)
+zv speed --json                        # Print benchmark results without prompting or saving ranks
 zv help                                # Detailed instructions for zv. Use `--help` for long help or `-h` for short help with a subcommand.
 zv uninstall                           # Uninstall zv completely by attempting to remove ZV_DIR.
 ```
