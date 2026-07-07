@@ -488,8 +488,8 @@ impl ZvNetwork {
                     target: "zv::network::fetch_master_version",
                     "Got complete master ZigRelease from partial fetch"
                 );
-                let is_new = prev_master_version.as_ref()
-                    != Some(complete_release.resolved_version());
+                let is_new =
+                    prev_master_version.as_ref() != Some(complete_release.resolved_version());
                 if is_new {
                     self.persist_master_fetched_metadata(Some(complete_release.clone()))
                         .await;

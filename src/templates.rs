@@ -163,7 +163,7 @@ impl Template {
 
     fn instantiate_minimal(&self) -> Result<Vec<FileStatus>, ZvError> {
         let files = [
-            ("main.zig", MAIN_ZIG),
+            ("src/main.zig", MAIN_ZIG),
             ("build.zig", BUILD_ZIG),
             (".gitignore", GITIGNORE_ZIG),
         ];
@@ -173,7 +173,7 @@ impl Template {
 
     async fn instantiate_package(&self, app: App) -> Result<Vec<FileStatus>, ZvError> {
         let minimal_files = [
-            ("main.zig", MAIN_ZIG),
+            ("src/main.zig", MAIN_ZIG),
             ("build.zig", BUILD_ZIG),
             (".gitignore", GITIGNORE_ZIG),
         ];
@@ -193,6 +193,7 @@ impl Template {
     /// Create template files with rollback
     fn create_template_files(&self, files: &[(&str, &str)]) -> Result<Vec<FileStatus>, ZvError> {
         let mut file_statuses = Vec::new();
+        let mut created_dirs = Vec::new();
 
         for (file_name, content) in files.iter() {
             let file_path = self
@@ -205,12 +206,17 @@ impl Template {
             if file_path.exists() {
                 file_statuses.push(FileStatus::Preserved(file_path));
             } else {
+                if let Err(e) = self.create_parent_dirs(&file_path, &mut created_dirs) {
+                    self.rollback_created_files(&file_statuses, &created_dirs);
+                    return Err(e);
+                }
+
                 // Mark as created BEFORE attempting write, so it gets cleaned up on failure
                 file_statuses.push(FileStatus::Created(file_path));
 
                 if let Err(e) = write_file(file_statuses.last().unwrap().path(), content) {
                     // Rollback all files created in this batch (including the one that just failed)
-                    self.rollback_created_files(&file_statuses);
+                    self.rollback_created_files(&file_statuses, &created_dirs);
                     return Err(e);
                 }
             }
@@ -219,8 +225,52 @@ impl Template {
         Ok(file_statuses)
     }
 
+    fn create_parent_dirs(
+        &self,
+        file_path: &Path,
+        created_dirs: &mut Vec<PathBuf>,
+    ) -> Result<(), ZvError> {
+        let target_dir = &self
+            .context
+            .as_ref()
+            .expect("Context should be initialized")
+            .target_dir;
+        let Some(parent) = file_path.parent() else {
+            return Ok(());
+        };
+
+        if parent == target_dir || parent.is_dir() {
+            return Ok(());
+        }
+
+        let mut missing_dirs = Vec::new();
+        let mut dir = parent;
+        while dir != target_dir {
+            if dir.is_dir() {
+                break;
+            }
+            missing_dirs.push(dir.to_path_buf());
+            let Some(next) = dir.parent() else {
+                break;
+            };
+            dir = next;
+        }
+
+        fs::create_dir_all(parent).map_err(|e| {
+            ZvError::TemplateError(eyre!("Failed to create {}: {}", parent.display(), e))
+        })?;
+
+        for dir in missing_dirs {
+            if !created_dirs.contains(&dir) {
+                created_dirs.push(dir);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Rollback strategy: remove created files or entire directory
-    fn rollback_created_files(&self, file_statuses: &[FileStatus]) {
+    fn rollback_created_files(&self, file_statuses: &[FileStatus], created_dirs: &[PathBuf]) {
         // If we created the directory, remove the entire directory
         if self
             .context
@@ -241,6 +291,9 @@ impl Template {
                 if let FileStatus::Created(path) = status {
                     let _ = fs::remove_file(path);
                 }
+            }
+            for dir in created_dirs {
+                let _ = fs::remove_dir(dir);
             }
         }
     }
@@ -417,11 +470,12 @@ pub enum TemplateType {
 pub const GITIGNORE_ZIG: &str = r#"zig-out
 .zig-cache"#;
 
-pub const MAIN_ZIG: &str = r#"pub fn main() !void {
-    std.log.info("Hello, World!", .{});
+pub const MAIN_ZIG: &str = r#"const std = @import("std");
+
+pub fn main() !void {
+    std.debug.print("Hello, World!\n", .{});
 }
-    
-const std = @import("std");"#;
+"#;
 
 pub const BUILD_ZIG: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
