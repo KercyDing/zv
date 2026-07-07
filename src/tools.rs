@@ -151,40 +151,40 @@ fn xdg_dirs_exist() -> bool {
 
 /// `$XDG_DATA_HOME` → defaults to `$HOME/.local/share`
 fn xdg_data_home() -> Result<PathBuf> {
-    if let Ok(val) = std::env::var("XDG_DATA_HOME") {
-        if !val.is_empty() {
-            return Ok(PathBuf::from(val));
-        }
+    if let Ok(val) = std::env::var("XDG_DATA_HOME")
+        && !val.is_empty()
+    {
+        return Ok(PathBuf::from(val));
     }
     home_dir().map(|h| h.join(".local/share"))
 }
 
 /// `$XDG_CONFIG_HOME` → defaults to `$HOME/.config`
 fn xdg_config_home() -> Result<PathBuf> {
-    if let Ok(val) = std::env::var("XDG_CONFIG_HOME") {
-        if !val.is_empty() {
-            return Ok(PathBuf::from(val));
-        }
+    if let Ok(val) = std::env::var("XDG_CONFIG_HOME")
+        && !val.is_empty()
+    {
+        return Ok(PathBuf::from(val));
     }
     home_dir().map(|h| h.join(".config"))
 }
 
 /// `$XDG_CACHE_HOME` → defaults to `$HOME/.cache`
 fn xdg_cache_home() -> Result<PathBuf> {
-    if let Ok(val) = std::env::var("XDG_CACHE_HOME") {
-        if !val.is_empty() {
-            return Ok(PathBuf::from(val));
-        }
+    if let Ok(val) = std::env::var("XDG_CACHE_HOME")
+        && !val.is_empty()
+    {
+        return Ok(PathBuf::from(val));
     }
     home_dir().map(|h| h.join(".cache"))
 }
 
 /// `$XDG_BIN_HOME` → defaults to `$HOME/.local/bin` (informal convention)
 fn xdg_bin_home() -> Result<PathBuf> {
-    if let Ok(val) = std::env::var("XDG_BIN_HOME") {
-        if !val.is_empty() {
-            return Ok(PathBuf::from(val));
-        }
+    if let Ok(val) = std::env::var("XDG_BIN_HOME")
+        && !val.is_empty()
+    {
+        return Ok(PathBuf::from(val));
     }
     home_dir().map(|h| h.join(".local/bin"))
 }

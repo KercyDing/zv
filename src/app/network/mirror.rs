@@ -111,6 +111,17 @@ pub struct Mirror {
     pub rank: u8,
 }
 
+pub struct DownloadRequest<'a> {
+    pub client: &'a reqwest::Client,
+    pub semver_version: &'a semver::Version,
+    pub zig_tarball: &'a str,
+    pub tarball_path: &'a Path,
+    pub minisig_path: &'a Path,
+    pub expected_shasum: Option<&'a str>,
+    pub expected_size: Option<u64>,
+    pub progress_handle: &'a ProgressHandle,
+}
+
 // ============================================================================
 // MIRROR IMPLEMENTATION
 // ============================================================================
@@ -123,48 +134,18 @@ impl Mirror {
     ///
     /// # Arguments
     ///
-    /// * `client` - HTTP client for making requests
-    /// * `semver_version` - Version to download
-    /// * `zig_tarball` - Name of the tarball file
-    /// * `tarball_path` - Path where tarball should be saved
-    /// * `minisig_path` - Path where minisig file should be saved
-    /// * `expected_shasum` - Optional expected SHA256 checksum for verification
-    /// * `expected_size` - Optional expected size of the tarball in bytes
-    /// * `progress_handle` - Handle for progress reporting
+    /// * `request` - Download inputs, output paths, and progress handle
     ///
     /// # Returns
     ///
     /// `Ok(Layout)` with the layout that was successfully used if download succeeds,
     /// otherwise returns the appropriate `NetErr` with detailed context about the failure.
-    pub async fn download(
-        &self,
-        client: &reqwest::Client,
-        semver_version: &semver::Version,
-        zig_tarball: &str,
-        tarball_path: &Path,
-        minisig_path: &Path,
-        expected_shasum: Option<&str>,
-        expected_size: Option<u64>,
-        progress_handle: &ProgressHandle,
-    ) -> Result<Layout, NetErr> {
+    pub async fn download(&self, request: DownloadRequest<'_>) -> Result<Layout, NetErr> {
         const TARGET: &str = "zv::network::mirror::download";
         tracing::debug!(target: TARGET, "Starting download with mirror: {} (rank: {})", self.base_url, self.rank);
 
         // Try download with current layout, fall back to alternate on HTTP 404
-        match self
-            .try_download_with_layout(
-                client,
-                semver_version,
-                zig_tarball,
-                tarball_path,
-                minisig_path,
-                expected_shasum,
-                expected_size,
-                progress_handle,
-                false,
-            )
-            .await
-        {
+        match self.try_download_with_layout(&request, false).await {
             Ok(layout) => Ok(layout),
             Err(net_err) => {
                 // If the failure was an HTTP 404, try the alternate layout
@@ -173,19 +154,7 @@ impl Mirror {
                                   "Initial layout failed with HTTP 404. Trying alternate layout for mirror {}...",
                                   self.base_url);
 
-                    return self
-                        .try_download_with_layout(
-                            client,
-                            semver_version,
-                            zig_tarball,
-                            tarball_path,
-                            minisig_path,
-                            expected_shasum,
-                            expected_size,
-                            progress_handle,
-                            true,
-                        )
-                        .await;
+                    return self.try_download_with_layout(&request, true).await;
                 }
 
                 // Otherwise propagate the concrete network error
@@ -197,14 +166,7 @@ impl Mirror {
     /// Internal helper to try download with a specific layout
     async fn try_download_with_layout(
         &self,
-        client: &reqwest::Client,
-        semver_version: &semver::Version,
-        zig_tarball: &str,
-        tarball_path: &Path,
-        minisig_path: &Path,
-        expected_shasum: Option<&str>,
-        expected_size: Option<u64>,
-        progress_handle: &ProgressHandle,
+        request: &DownloadRequest<'_>,
         use_alternate_layout: bool,
     ) -> Result<Layout, NetErr> {
         const TARGET: &str = "zv::network::mirror::try_download_with_layout";
@@ -219,19 +181,21 @@ impl Mirror {
         };
 
         // Get download URLs
-        let tarball_url = mirror_for_download.get_download_url(semver_version, zig_tarball);
-        let minisig_filename = format!("{}.minisig", zig_tarball);
-        let minisig_url = mirror_for_download.get_download_url(semver_version, &minisig_filename);
+        let tarball_url =
+            mirror_for_download.get_download_url(request.semver_version, request.zig_tarball);
+        let minisig_filename = format!("{}.minisig", request.zig_tarball);
+        let minisig_url =
+            mirror_for_download.get_download_url(request.semver_version, &minisig_filename);
 
         tracing::trace!(target: TARGET, "Download URLs configured:");
         tracing::trace!(target: TARGET, "  Tarball: {}", tarball_url);
         tracing::trace!(target: TARGET, "  Minisig:  {}", minisig_url);
-        if let Some(size) = expected_size {
+        if let Some(size) = request.expected_size {
             tracing::trace!(target: TARGET, "  Expected size: {} bytes ({:.1} MB)", size, size as f64 / 1_048_576.0);
         } else {
             tracing::trace!(target: TARGET, "  Expected size: unknown");
         }
-        if let Some(shasum) = expected_shasum {
+        if let Some(shasum) = request.expected_shasum {
             tracing::trace!(target: TARGET, "  Expected checksum: {}", shasum);
         } else {
             tracing::trace!(target: TARGET, "  Expected checksum: unknown");
@@ -240,9 +204,9 @@ impl Mirror {
         // Initialize progress reporting
         let progress_msg = format!(
             "Downloading {} from {}",
-            zig_tarball, mirror_for_download.base_url
+            request.zig_tarball, mirror_for_download.base_url
         );
-        match progress_handle.start(&progress_msg).await {
+        match request.progress_handle.start(&progress_msg).await {
             Ok(()) => {}
             Err(e) => {
                 tracing::debug!(target: TARGET, "Failed to start progress reporting: {} - continuing without progress updates", e);
@@ -251,11 +215,11 @@ impl Mirror {
 
         // Phase 1: Download tarball
         match download_file(
-            client,
+            request.client,
             &tarball_url,
-            tarball_path,
-            expected_size.unwrap_or(0),
-            progress_handle,
+            request.tarball_path,
+            request.expected_size.unwrap_or(0),
+            request.progress_handle,
         )
         .await
         {
@@ -282,17 +246,18 @@ impl Mirror {
         }
 
         // Phase 2: Verify checksum (if available)
-        if let Some(shasum) = expected_shasum {
+        if let Some(shasum) = request.expected_shasum {
             tracing::debug!(target: TARGET, "Verifying tarball integrity");
-            match verify_checksum(tarball_path, shasum).await {
+            match verify_checksum(request.tarball_path, shasum).await {
                 Ok(()) => {
                     tracing::debug!(target: TARGET, "Checksum verification successful");
                 }
                 Err(e) => {
                     tracing::error!(target: TARGET, "Checksum verification failed for tarball from mirror {}: {}", mirror_for_download.base_url, e);
                     // Clean up the corrupted file
-                    if tarball_path.exists() {
-                        if let Err(cleanup_err) = tokio::fs::remove_file(tarball_path).await {
+                    if request.tarball_path.exists() {
+                        if let Err(cleanup_err) = tokio::fs::remove_file(request.tarball_path).await
+                        {
                             tracing::warn!(target: TARGET, "Failed to remove corrupted tarball file: {}", cleanup_err);
                         } else {
                             tracing::debug!(target: TARGET, "Removed corrupted tarball file");
@@ -307,7 +272,8 @@ impl Mirror {
 
         // Phase 3: Download minisig file
         tracing::debug!(target: TARGET, "Downloading signature file from {}", minisig_url);
-        match progress_handle
+        match request
+            .progress_handle
             .update("Downloading signature file...")
             .await
         {
@@ -320,7 +286,15 @@ impl Mirror {
         }
 
         // For minisig, we don't have size info, so use 0
-        match download_file(client, &minisig_url, minisig_path, 0, progress_handle).await {
+        match download_file(
+            request.client,
+            &minisig_url,
+            request.minisig_path,
+            0,
+            request.progress_handle,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::debug!(target: TARGET, "Minisig download completed successfully");
             }
@@ -341,8 +315,8 @@ impl Mirror {
                 }
 
                 // Clean up the tarball since we couldn't get the signature
-                if tarball_path.exists() {
-                    if let Err(cleanup_err) = tokio::fs::remove_file(tarball_path).await {
+                if request.tarball_path.exists() {
+                    if let Err(cleanup_err) = tokio::fs::remove_file(request.tarball_path).await {
                         tracing::trace!(target: TARGET, "Failed to remove tarball after minisig failure: {}", cleanup_err);
                     } else {
                         tracing::trace!(target: TARGET, "Cleaned up tarball after minisig download failure");
@@ -353,12 +327,12 @@ impl Mirror {
         }
 
         // Verify both files exist and have reasonable sizes
-        let tarball_size = match tokio::fs::metadata(tarball_path).await {
+        let tarball_size = match tokio::fs::metadata(request.tarball_path).await {
             Ok(metadata) => {
                 let size = metadata.len();
                 tracing::debug!(target: TARGET, "Final tarball size: {} bytes ({:.1} MB)", size, size as f64 / 1_048_576.0);
 
-                if let Some(expected) = expected_size {
+                if let Some(expected) = request.expected_size {
                     if size != expected {
                         tracing::warn!(target: TARGET, "Tarball size {} doesn't match expected size {} - this may indicate an issue", size, expected);
                     }
@@ -374,7 +348,7 @@ impl Mirror {
             }
         };
 
-        let minisig_size = match tokio::fs::metadata(minisig_path).await {
+        let minisig_size = match tokio::fs::metadata(request.minisig_path).await {
             Ok(metadata) => {
                 let size = metadata.len();
                 tracing::debug!(target: TARGET, "Final minisig size: {} bytes", size);

@@ -167,7 +167,7 @@ pub async fn resolve_zig_version(
 
             // Validate the version exists using RespectTTL strategy
             let zig_release = app.validate_semver(v).await?;
-            app.to_install = Some(zig_release.into());
+            app.to_install = Some(zig_release);
             Ok(ResolvedZigVersion::Semver(v.clone()))
         }
 
@@ -194,7 +194,7 @@ pub async fn resolve_zig_version(
         ZigVersion::Latest(Some(v)) => {
             tracing::trace!(target: TARGET, "Resolving latest version: {}", v);
             let zig_release = app.validate_semver(v).await?;
-            app.to_install = Some(zig_release.into());
+            app.to_install = Some(zig_release);
             Ok(ResolvedZigVersion::Semver(v.clone()))
         }
 

@@ -10,10 +10,11 @@ pub async fn list_opts(mut app: App, all: bool, mirrors: bool, refresh: bool) ->
     } else if all && mirrors {
         let mut app = list_all(app, refresh).await?;
         println!("{SEPARATOR}");
-        let _ = list_mirrors(&mut app, refresh).await?;
+        list_mirrors(&mut app, refresh).await?;
         Ok(())
     } else if all {
-        list_all(app, refresh).await.and_then(|_| Ok(()))
+        list_all(app, refresh).await?;
+        Ok(())
     } else if mirrors {
         list_mirrors(&mut app, refresh).await
     } else {

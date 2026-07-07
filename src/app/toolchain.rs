@@ -850,9 +850,7 @@ impl ToolchainManager {
                 crate::app::config::save_zv_config(&self.zv_config_file, &updated_config)
             {
                 tracing::warn!(target: TARGET, "Failed to clear active zig from config: {}", e);
-                return Err(eyre!(e)
-                    .wrap_err("Failed to clear active version from config")
-                    .into());
+                return Err(eyre!(e).wrap_err("Failed to clear active version from config"));
             }
         } else {
             // Config file doesn't exist, create one with no active zig
@@ -865,7 +863,7 @@ impl ToolchainManager {
 
             if let Err(e) = crate::app::config::save_zv_config(&self.zv_config_file, &config) {
                 tracing::warn!(target: TARGET, "Failed to create config file: {}", e);
-                return Err(eyre!(e).wrap_err("Failed to create config file").into());
+                return Err(eyre!(e).wrap_err("Failed to create config file"));
             }
         }
 
@@ -951,8 +949,7 @@ impl ToolchainManager {
     pub fn clear_local_master_version(&self) -> Result<()> {
         if let Ok(mut config) = crate::app::config::load_zv_config(&self.zv_config_file) {
             config.local_master_zig = None;
-            crate::app::config::save_zv_config(&self.zv_config_file, &config)
-                .map_err(|e| eyre!(e).into())
+            crate::app::config::save_zv_config(&self.zv_config_file, &config).map_err(|e| eyre!(e))
         } else {
             Ok(())
         }

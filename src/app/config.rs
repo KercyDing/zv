@@ -42,32 +42,32 @@ pub struct ActiveZig {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("Failed to read zv.toml: {0}")]
-    ReadConfig(#[source] std::io::Error),
+    Read(#[source] std::io::Error),
 
     #[error("Failed to write zv.toml: {0}")]
-    WriteConfig(#[source] std::io::Error),
+    Write(#[source] std::io::Error),
 
     #[error("Failed to parse zv.toml: {0}")]
-    ParseConfig(#[source] toml::de::Error),
+    Parse(#[source] toml::de::Error),
 }
 
 /// Load zv configuration from zv.toml
 pub fn load_zv_config(path: &Path) -> Result<ZvConfig, ConfigError> {
-    let contents = sync_fs::read_to_string(path).map_err(ConfigError::ReadConfig)?;
+    let contents = sync_fs::read_to_string(path).map_err(ConfigError::Read)?;
 
-    toml::from_str(&contents).map_err(ConfigError::ParseConfig)
+    toml::from_str(&contents).map_err(ConfigError::Parse)
 }
 
 /// Save zv configuration to zv.toml
 pub fn save_zv_config(path: &Path, config: &ZvConfig) -> Result<(), ConfigError> {
     let contents = toml::to_string_pretty(config).map_err(|e| {
-        ConfigError::WriteConfig(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to serialize config: {}", e),
-        ))
+        ConfigError::Write(std::io::Error::other(format!(
+            "Failed to serialize config: {}",
+            e
+        )))
     })?;
 
-    sync_fs::write(path, contents).map_err(ConfigError::WriteConfig)?;
+    sync_fs::write(path, contents).map_err(ConfigError::Write)?;
 
     Ok(())
 }

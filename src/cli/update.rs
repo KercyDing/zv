@@ -348,7 +348,7 @@ fn find_latest_version(
             }
 
             // Check if this is the best version so far
-            if best_version.as_ref().map_or(true, |best| version > *best) {
+            if best_version.as_ref().is_none_or(|best| version > *best) {
                 best_version = Some(version);
                 best_release = Some(release);
             }

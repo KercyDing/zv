@@ -494,7 +494,9 @@ fn write_file(path: &Path, content: &str) -> Result<(), ZvError> {
 
 /// Parse a line from zig init output to extract file operations
 /// Returns (status_constructor, file_path) if a file operation is found
-fn parse_zig_output_line(line: &str) -> Option<(fn(PathBuf) -> FileStatus, &str)> {
+type FileStatusParser = fn(PathBuf) -> FileStatus;
+
+fn parse_zig_output_line(line: &str) -> Option<(FileStatusParser, &str)> {
     let line = line.trim();
 
     // Find the last colon and extract the file path after it

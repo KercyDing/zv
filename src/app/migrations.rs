@@ -29,7 +29,7 @@ pub async fn migrate(zv_root: &Path, config_file: &Path) -> Result<()> {
         tracing::debug!("zv.toml not found, legacy migration needed");
         None
     } else {
-        match load_zv_config(&zv_toml_path) {
+        match load_zv_config(zv_toml_path) {
             Ok(config) => Some(config),
             Err(e) => {
                 tracing::warn!("Failed to load zv.toml, will recreate: {}", e);
@@ -79,20 +79,20 @@ pub async fn migrate(zv_root: &Path, config_file: &Path) -> Result<()> {
             zls: None,
         };
 
-        save_zv_config(&zv_toml_path, &config)?;
+        save_zv_config(zv_toml_path, &config)?;
     } else if let Some(mut config) = existing_config {
         let mut changed = false;
 
-        if let Ok(config_version) = Version::parse(&config.version) {
-            if config_version < current_version_parsed {
-                tracing::debug!(
-                    "Updating config version {} -> {}",
-                    config_version,
-                    current_version
-                );
-                config.version = current_version.to_string();
-                changed = true;
-            }
+        if let Ok(config_version) = Version::parse(&config.version)
+            && config_version < current_version_parsed
+        {
+            tracing::debug!(
+                "Updating config version {} -> {}",
+                config_version,
+                current_version
+            );
+            config.version = current_version.to_string();
+            changed = true;
         }
 
         if config.local_master_zig.is_none()
@@ -103,7 +103,7 @@ pub async fn migrate(zv_root: &Path, config_file: &Path) -> Result<()> {
             changed = true;
         }
 
-        if changed && let Err(e) = save_zv_config(&zv_toml_path, &config) {
+        if changed && let Err(e) = save_zv_config(zv_toml_path, &config) {
             tracing::error!("Failed to save migrated config: {}", e);
         }
     }
@@ -126,6 +126,7 @@ fn read_local_master_zig(zv_root: &Path) -> Option<String> {
 /// Migration from 0.8.0 to 0.9.0
 /// - Flattens versions/master/* → versions/*
 /// - Migrates active.json → zv.toml
+///
 /// Returns migrated active zig (if any)
 async fn migrate_0_8_0_to_0_9_0(zv_root: &Path) -> Result<Option<ActiveZig>> {
     tracing::info!("Running v0.9.0 migrations");
@@ -263,16 +264,13 @@ async fn migrate_active_json(active_json_path: &Path) -> Result<ActiveZig> {
     let mut path = zig_install.path;
     // If it was a master build, the path in active.json points to .../versions/master/<hash>
     // We need to update it to .../versions/<hash> as we flattened the directory
-    if zig_install.is_master {
-        if let Some(parent) = path.parent() {
-            if parent.file_name() == Some(std::ffi::OsStr::new("master")) {
-                if let Some(grandparent) = parent.parent() {
-                    if let Some(file_name) = path.file_name() {
-                        path = grandparent.join(file_name);
-                    }
-                }
-            }
-        }
+    if zig_install.is_master
+        && let Some(parent) = path.parent()
+        && parent.file_name() == Some(std::ffi::OsStr::new("master"))
+        && let Some(grandparent) = parent.parent()
+        && let Some(file_name) = path.file_name()
+    {
+        path = grandparent.join(file_name);
     }
 
     let active_zig = ActiveZig {

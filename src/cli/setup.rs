@@ -133,7 +133,6 @@ fn print_dir_table_and_ensure(app: &App) -> crate::Result<bool> {
 
 /// Main setup_shell function that orchestrates the three-phase setup process
 /// This is the public interface that maintains backward compatibility and supports interactive mode
-
 pub async fn setup_shell(
     #[allow(unused_variables)] app: &mut App,
     #[allow(unused_variables)] using_env_var: bool,
@@ -148,7 +147,7 @@ pub async fn setup_shell(
             Paint::green("✓"),
             Paint::blue("zv sync")
         );
-        return Ok(());
+        Ok(())
     }
 
     // On macOS Tier 1 (XDG dirs exist), same as Linux

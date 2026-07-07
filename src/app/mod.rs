@@ -192,9 +192,9 @@ impl App {
     }
 
     /// Set the active Zig version. Optionally provide the installed path to skip re-checking installation
-    pub async fn set_active_version<'b>(
+    pub async fn set_active_version(
         &mut self,
-        version: &'b ResolvedZigVersion,
+        version: &ResolvedZigVersion,
         installed_path: Option<PathBuf>,
     ) -> crate::Result<()> {
         // Copy zv binary to bin directory if needed and regenerate shims
@@ -236,12 +236,8 @@ impl App {
             .await?;
             net.ensure_mirror_manager().await?;
             self.network = Some(net);
-        } else if self.network.is_some() {
-            self.network
-                .as_mut()
-                .unwrap()
-                .ensure_mirror_manager()
-                .await?;
+        } else if let Some(network) = self.network.as_mut() {
+            network.ensure_mirror_manager().await?;
         }
         Ok(())
     }
@@ -591,7 +587,7 @@ impl App {
             } else {
                 format!(
                     "https://ziglang.org/download/{}/{zig_tarball}",
-                    semver_version.to_string()
+                    semver_version
                 )
             };
             let ziglang_org_minisig = format!("{}.minisig", ziglang_org_tarball);

@@ -228,16 +228,16 @@ impl ZvNetwork {
             // Attempt download with this mirror
             let original_layout = selected_mirror.layout;
             let download_result = selected_mirror
-                .download(
-                    &self.client,
+                .download(DownloadRequest {
+                    client: &self.client,
                     semver_version,
                     zig_tarball,
-                    &temp_tarball_path,
-                    &temp_minisig_path,
-                    shasum.map(|s| s.as_str()),
-                    size,
-                    &progress_handle,
-                )
+                    tarball_path: &temp_tarball_path,
+                    minisig_path: &temp_minisig_path,
+                    expected_shasum: shasum.map(|value| value.as_str()),
+                    expected_size: size,
+                    progress_handle: &progress_handle,
+                })
                 .await;
 
             match download_result {
@@ -728,7 +728,7 @@ impl ZvNetwork {
 
         crate::app::minisign::verify_minisign_signature(
             minisign_pubkey,
-            &zig_tarball,
+            zig_tarball,
             &final_tarball_path,
             &final_minisig_path,
         )?;
